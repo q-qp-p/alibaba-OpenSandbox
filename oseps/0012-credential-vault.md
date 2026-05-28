@@ -466,11 +466,71 @@ Template sources:
 
 1. **Built-in templates**
    - Shipped with OpenSandbox.
-   - Cover common protocols such as `git-https-basic`, `generic-bearer`, and `generic-basic`.
+   - Cover common protocols listed in the built-in template catalog below.
 2. **Operator-configured templates**
    - Defined in server configuration under `[credential_vault]`.
    - Intended for enterprise-specific targets and path constraints.
    - Override or conflict with built-in names only if the operator uses an explicit namespace such as `operator/alibaba-code-git`.
+
+Built-in template catalog:
+
+| Template | Required params | Optional params | Credential input | Injection |
+|----------|-----------------|-----------------|------------------|-----------|
+| `git-https-basic` | `target`, `repoPath` | none | `username:token` | `Authorization: Basic {{ credential | base64 }}` |
+| `generic-bearer` | `target` | `pathPrefix`, `methods` | bearer token | `Authorization: Bearer {{ credential }}` |
+| `generic-basic` | `target` | `pathPrefix`, `methods` | `username:password` | `Authorization: Basic {{ credential | base64 }}` |
+| `openai-bearer` | `target` | `pathPrefix` | API key | `Authorization: Bearer {{ credential }}` |
+| `github-token` | `target` | `pathPrefix` | GitHub token | `Authorization: Bearer {{ credential }}` |
+| `gitlab-token` | `target` | `pathPrefix`, `mode` | GitLab token | `PRIVATE-TOKEN: {{ credential }}` by default, or `Authorization: Bearer {{ credential }}` when `mode=bearer` |
+| `npm-token` | `target` | `pathPrefix` | npm token | `Authorization: Bearer {{ credential }}` |
+| `pypi-token` | `target` | `pathPrefix` | PyPI API token | `Authorization: Basic {{ '__token__:' + credential | base64 }}` |
+
+All built-in templates default to:
+
+- `schemes: ["https"]`
+- `ports: [443]`
+- egress validation against the expanded target
+- no credential injection on HTTP unless an operator-configured template explicitly allows it
+
+Built-in template expansion examples:
+
+```yaml
+git-https-basic:
+  requiredParams: [target, repoPath]
+  credentialInput: username:token
+  scope:
+    schemes: [https]
+    ports: [443]
+    targets: ["{{ target }}"]
+    methods: [GET, POST]
+    paths: ["{{ repoPath }}", "{{ repoPath }}/*"]
+  injection:
+    type: header
+    name: Authorization
+    value: "Basic {{ credential | base64 }}"
+
+generic-bearer:
+  requiredParams: [target]
+  optionalParams: [pathPrefix, methods]
+  credentialInput: token
+  scope:
+    schemes: [https]
+    ports: [443]
+    targets: ["{{ target }}"]
+    methods: "{{ methods | default([GET, POST, PUT, PATCH, DELETE]) }}"
+    paths: ["{{ pathPrefix | default('/*') }}"]
+  injection:
+    type: header
+    name: Authorization
+    value: "Bearer {{ credential }}"
+```
+
+Provider-specific notes:
+
+- `openai-bearer` is equivalent to `generic-bearer` with OpenAI-compatible API defaults. Operators should pin `target` for managed deployments.
+- `github-token` uses `Authorization: Bearer` by default for modern GitHub API usage.
+- `gitlab-token` defaults to GitLab's `PRIVATE-TOKEN` header for API usage; `mode=bearer` is available for deployments that use OAuth/JWT bearer tokens.
+- `pypi-token` is intended for PyPI-compatible APIs that accept Basic auth with `__token__` as the username. Package manager behavior varies, so operators may prefer an operator-configured template for private indexes.
 
 Example server configuration:
 
@@ -726,7 +786,8 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 - Schema validation accepts valid full bindings and rejects full bindings missing `name`, `sourceRef`, `scope`, or `injection`.
 - Schema validation accepts valid template bindings and rejects bindings that mix full-binding fields with template fields.
 - Template params are validated by template type, and sensitive values in params are rejected.
-- Template expansion produces the expected scope and injection policy for `git-https-basic`.
+- Template expansion produces the expected scope and injection policy for every built-in template.
+- Provider-specific built-ins such as `gitlab-token` and `pypi-token` validate supported modes and credential rendering.
 - Scheme, port, FQDN, wildcard, method, and path matching work as expected.
 - Injection defaults to HTTPS/443 only and rejects HTTP injection unless explicitly configured and permitted.
 - Multiple matching bindings fail closed.
