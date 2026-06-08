@@ -310,7 +310,7 @@ internal class FilesystemAdapter(
     }
 
     override fun replaceContents(entries: List<ContentReplaceEntry>) {
-        return try {
+        try {
             val replaceMap = entries.toApiReplaceFileContentMap()
             api.replaceContent(replaceMap)
         } catch (e: Exception) {
