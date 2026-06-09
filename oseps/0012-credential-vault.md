@@ -161,7 +161,7 @@ At a high level:
 2. **HTTPS interception requires trusted CA setup**: Transparent HTTPS injection depends on the sandbox trusting the mitmproxy root CA. Images or runtime startup must install the OpenSandbox MITM CA, otherwise HTTPS handshakes fail.
 3. **Credential source access is sidecar-local in the MVP**: Runtime sidecars should not be granted broad cluster secret access. The MVP accepts only inline values sent to the egress sidecar API and converts them into sandbox-scoped in-memory material.
 4. **Credential material must be short-lived in memory**: Credential Proxy should not persist plaintext credentials on disk. If temporary files are unavoidable for runtime delivery, they must be scoped to one sandbox and cleaned up with sandbox deletion.
-5. **Binding scope must be covered by egress scope**: A sandbox must include `networkPolicy.egress` before a Credential Vault can be created, and every credential binding target must be covered by an allow rule. Missing or inconsistent egress policy fails vault creation or mutation.
+5. **Binding scope must be covered by egress scope**: A sandbox must include `networkPolicy.egress` before a Credential Vault can be created, and every credential binding target must be covered by an explicit allow rule. Missing or inconsistent egress policy fails vault creation or mutation.
 6. **Multiple matching bindings are ambiguous**: If more than one binding matches a request and no deterministic precedence is declared, Credential Proxy must fail closed.
 7. **Upstream echo is outside the absolute secrecy guarantee**: OpenSandbox-managed runtime, API, diagnostic, and log surfaces must not expose credentials, but an upstream service can still echo request headers in response bodies or headers. Credential Proxy should redact known credential values from responses where practical, and users should avoid binding credentials to services that echo sensitive request headers.
 8. **Runtime mutations use egress API auth**: Callers that can resolve the egress endpoint and provide the required egress auth header can create or mutate the Credential Vault.
@@ -517,6 +517,7 @@ components:
           enum: [apiKey]
         name:
           type: string
+          pattern: '^[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+$'
           description: Header name used for the API key.
         credential:
           type: string
@@ -532,6 +533,7 @@ components:
           enum: [customHeader]
         name:
           type: string
+          pattern: '^[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+$'
           description: Header name to inject. The header value is the referenced credential value.
         credential:
           type: string
@@ -559,6 +561,7 @@ components:
       properties:
         name:
           type: string
+          pattern: '^[A-Za-z0-9!#$%&''*+/=?^_`{|}~-]+$'
           description: Header name to inject. The header value is the referenced credential value.
         credential:
           type: string
@@ -583,6 +586,7 @@ Validation rules:
 - `CredentialVaultCreateRequest.credentials[].name` values and active credential names after any mutation must be unique within a sandbox.
 - `CredentialVaultCreateRequest.bindings[].name` values and active binding names after any mutation must be unique within a sandbox.
 - Every credential reference in `auth.credential` and `auth.headers[].credential` must reference a credential declared in the vault creation request or active post-mutation credential set.
+- Header names in `apiKey`, `customHeader`, and `customHeaders.headers[]` must be valid HTTP field names and must not be routing, framing, hop-by-hop, or proxy-control headers. The egress sidecar must reject at least `Host`, `Content-Length`, `Content-Type`, `Transfer-Encoding`, `Connection`, `Upgrade`, `TE`, `Trailer`, `Proxy-Authorization`, `Proxy-Authenticate`, `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, and `X-Forwarded-Proto` unless a future design explicitly allows them.
 - Inline ephemeral is the only public MVP credential source. Future provider-backed sources must be added as new `CredentialSource` discriminator variants with source-specific authorization and destination constraints.
 - `match.hosts[]` supports only exact hosts such as `api.github.com` and leftmost-label subdomain wildcards such as `*.github.com`. The wildcard form matches `api.github.com` and `a.b.github.com`, but does not match the apex host `github.com`.
 - Host matching must normalize hosts before evaluation, including lowercase normalization and IDNA handling. Other wildcard forms such as `api.*.com`, `*github.com`, and `*` are invalid.
@@ -866,13 +870,13 @@ type CredentialBinding = {
 
 type CredentialAuth =
   | { type: "bearer"; credential: string }
-  | { type: "basic"; usernameCredential?: string; passwordCredential: string }
-  | { type: "apiKey"; name: string; in: "header" | "query"; credential: string }
+  | { type: "basic"; credential: string }
+  | { type: "apiKey"; name: string; credential: string }
   | { type: "customHeader"; name: string; credential: string }
   | { type: "customHeaders"; headers: Array<{ name: string; credential: string }> };
 ```
 
-For the MVP, SDK public inputs treat inline as the default credential source type, so callers do not need to specify `source.type`. SDK adapters should normalize SDK input to the wire format expected by the egress API. The `InlineCredentialSource.value` field is write-only from the API perspective. SDKs must not log it, echo it in debug output, or include it in sanitized read models.
+For the MVP, SDK public inputs treat inline as the default credential source type, so callers do not need to specify `source.type`. SDK adapters should normalize SDK input to the wire format expected by the egress API. SDK `CredentialAuth` shapes should match the egress API wire schema: `basic.credential` references a credential containing the pre-encoded `base64(username:password)` value, and `apiKey` injects into a request header named by `name`. The `InlineCredentialSource.value` field is write-only from the API perspective. SDKs must not log it, echo it in debug output, or include it in sanitized read models.
 
 #### Python
 
@@ -1065,10 +1069,10 @@ Sandboxes must include `networkPolicy.egress` before a Credential Vault can be c
 
 Required validation:
 
-- Every credential binding host must evaluate to an allow decision under the effective runtime egress policy.
-- The egress sidecar must reject any Credential Vault revision whose binding match conflicts with its effective egress policy, including ordered deny rules, first-match behavior, `ignore_hosts`, and non-intercepted ports.
-- `networkPolicy.defaultAction` should be `deny`; if `allow` is accepted for compatibility, callers should still keep credential-bearing destinations explicitly scoped.
-- If `networkPolicy` is omitted, if `egress` is empty, or if a binding host is not reachable under the effective egress policy, vault creation or mutation must fail with HTTP 400.
+- Every credential binding host must be covered by an explicit `networkPolicy.egress` allow rule. `networkPolicy.defaultAction=allow` does not count as credential binding coverage.
+- The egress sidecar must also reject any Credential Vault revision whose binding match conflicts with its effective runtime egress policy, including ordered deny rules, first-match behavior, `ignore_hosts`, and non-intercepted ports.
+- `networkPolicy.defaultAction` should be `deny`; if `allow` is accepted for compatibility, credential-bearing destinations still require explicit allow rules.
+- If `networkPolicy` is omitted, if `egress` is empty, if a binding host lacks explicit allow coverage, or if a binding host is not reachable under the effective egress policy, vault creation or mutation must fail with HTTP 400.
 - Runtime egress policy PATCH/DELETE requests for credential-enabled sandboxes must revalidate the complete active binding set. Updates that would make any active binding host non-allowed must fail, or the egress API must reject policy mutation while credentials are bound.
 
 Suggested egress sidecar configuration:
@@ -1183,6 +1187,7 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 - Schema validation rejects duplicate credential names and duplicate binding names.
 - Schema validation rejects binding auth references to unknown credential names, including `customHeaders.headers[].credential`.
 - Schema validation accepts `customHeaders` with multiple header entries and rejects duplicate header names within one auth rule.
+- Schema validation rejects invalid, routing, framing, hop-by-hop, and proxy-control header names in `apiKey`, `customHeader`, and `customHeaders`.
 - Scheme, port, FQDN, wildcard, method, and path matching work as expected.
 - Injection defaults to HTTPS/443 only and rejects HTTP injection unless explicitly configured and permitted.
 - Binding matches that use ports outside configured transparent MITM intercept ports are rejected.
@@ -1191,7 +1196,7 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 - Redaction removes credential values from logs and errors.
 - Response redaction removes known credential values from response headers and supported text bodies.
 - Inline credential `value` is accepted only as write-only Credential Vault create or runtime mutation input and never appears in serialized sandbox metadata or API responses.
-- Egress validation requires `networkPolicy.egress` and catches binding hosts not allowed by the effective ordered policy decision.
+- Egress validation requires `networkPolicy.egress`, catches binding hosts not covered by explicit allow rules, and does not treat `defaultAction=allow` as credential binding coverage.
 - The egress Credential Vault API rejects candidate revisions that conflict with the sidecar's effective egress policy.
 - Runtime egress policy mutations reject updates that would make active credential binding hosts non-allowed.
 - `POST /credential-vault` rejects duplicate credential and binding names, rejects unknown credential references, fails when the vault already exists, and returns success only after the initial revision is acknowledged by Credential Proxy.
@@ -1201,7 +1206,7 @@ All diagnostics APIs that surface runtime logs must preserve redaction behavior.
 - `PATCH /credential-vault` rejects requests when the vault does not exist.
 - Runtime mutations reject post-mutation binding sets that create ambiguous matches.
 - Runtime mutation revision handling keeps the previous acknowledged revision active when proxy acknowledgement fails and cleans up candidate runtime material prepared for the failed revision.
-- SDK facades resolve the egress endpoint, merge endpoint headers, call the sidecar directly, and do not expose credential or binding subresource write helpers.
+- SDK facades resolve the egress endpoint, merge endpoint headers, call the sidecar directly, expose `CredentialAuth` shapes that match the egress API wire schema, and do not expose credential or binding subresource write helpers.
 
 ### Integration Tests
 
